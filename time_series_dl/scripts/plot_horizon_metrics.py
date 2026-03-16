@@ -1,5 +1,6 @@
 import json
 import pathlib
+import typing
 
 from typing import Dict, List, Tuple
 
@@ -70,7 +71,7 @@ def bucket_horizon_metrics(
 
 
 def plot_forecast_error_vs_horizon(
-    json_path: str,
+    horizon_metrics_models: typing.Dict[str, typing.Dict[str, typing.Any]],
     metric: str = "mae",
     save_path: str = "forecast_error_vs_horizon.png",
 ):
@@ -79,8 +80,7 @@ def plot_forecast_error_vs_horizon(
 
     Parameters
     ----------
-    json_path : str
-        Path to results json file.
+    horizon_metrics_models :
 
     metric : str
         Error metric to plot ("mae", "rmse", "mse", "mape").
@@ -89,18 +89,9 @@ def plot_forecast_error_vs_horizon(
         Path to output figure.
     """
 
-    with open(json_path, "r") as f:
-        data = json.load(f)
-
-    models = {
-        "Persistence": data["persistence"]["horizon_metrics"],
-        "Mean Window": data["mean_window"]["horizon_metrics"],
-        "Drift": data["drift"]["horizon_metrics"],
-    }
-
     plt.figure(figsize=(12, 5))
 
-    for model_name, horizon_metrics in models.items():
+    for model_name, horizon_metrics in horizon_metrics_models.items():
         horizons = sorted(int(h) for h in horizon_metrics.keys())
 
         errors = [horizon_metrics[str(h)][metric] for h in horizons]
@@ -131,7 +122,8 @@ def plot_forecast_error_vs_horizon(
     plt.close()
 
 
-def main() -> None:
+def plot_baseline():
+    print("Collect BASELINE results")
     json_path = "results/baselines/all_baseline_results.json"
     with open(json_path, "r") as f:
         data = json.load(f)
@@ -139,7 +131,39 @@ def main() -> None:
     bucketed = bucket_horizon_metrics(data)
     print(bucketed)
 
-    plot_forecast_error_vs_horizon(json_path)
+    models = {
+        "Persistence": data["persistence"]["horizon_metrics"],
+        "Mean Window": data["mean_window"]["horizon_metrics"],
+        "Drift": data["drift"]["horizon_metrics"],
+    }
+
+    plot_forecast_error_vs_horizon(
+        models, save_path="figures/forecast_error_vs_horizon_baseline.png"
+    )
+
+
+def plot_non_dl():
+    print("Collect NON-DL results")
+
+    json_path = "results/non_dl_models/all_non_dl_results.json"
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    bucketed = bucket_horizon_metrics(data)
+    print(bucketed)
+
+    models = {
+        "Prophet": data["prophet"]["horizon_metrics"],
+        "ARIMA": data["arima"]["horizon_metrics"],
+    }
+    plot_forecast_error_vs_horizon(
+        models, save_path="figures/forecast_error_vs_horizon_non-dl.png"
+    )
+
+
+def main() -> None:
+    plot_baseline()
+    plot_non_dl()
 
 
 if __name__ == "__main__":
