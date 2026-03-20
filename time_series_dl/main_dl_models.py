@@ -1,4 +1,5 @@
 import logging
+import typing
 from pathlib import Path
 
 import pandas as pd
@@ -8,12 +9,9 @@ from time_series_dl.data.dataset import (
     split_dataset,
     build_forecasting_dataset,
 )
-from time_series_dl.evaluation.statistics import (
-    compute_metrics,
-    compute_statistics,
-    compute_horizon_metrics,
-)
-from time_series_dl.metrics.metrics import get_metrics
+
+import pytorch_lightning as pl
+from lightning.pytorch import Trainer
 
 import torch
 from pytorch_forecasting import (
@@ -22,49 +20,106 @@ from pytorch_forecasting import (
     TemporalFusionTransformer,
     DeepAR,
 )
-from pytorch_forecasting.data import NaNLabelEncoder
-from pytorch_forecasting.metrics import MAE, RMSE, MAPE
-from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
-from pytorch_forecasting.data.encoders import GroupNormalizer
-from pytorch_forecasting import Baseline
-from torch.utils.data import DataLoader
+from pytorch_forecasting.metrics import MAE
 
 from time_series_dl.utils.io import save_json
+
+
+from time_series_dl.evaluation.statistics import (
+    compute_metrics,
+    compute_statistics,
+    compute_horizon_metrics,
+)
+from time_series_dl.metrics.metrics import get_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def main():
+def convert_predictions_to_forecasts(
+    predictions: typing.Dict[str, torch.Tensor], x: typing.Dict[str, torch.Tensor], df: pd.DataFrame
+) -> list[pd.Series]:
+    forecasts = []
+
+    pred_values = predictions["prediction"].detach().cpu().numpy()
+    time_idx = x["decoder_time_idx"].detach().cpu().numpy()
+    date_lookup = df.set_index("time_idx")["date"]
+
+    for i in range(pred_values.shape[0]):
+
+        horizon = pred_values[i].squeeze(-1)
+        idx = time_idx[i]
+
+        dates = date_lookup.reindex(idx)
+
+        forecasts.append(pd.Series(horizon, index=dates.values))
+
+    return forecasts
+
+
+def build_dataset(
+    df: pd.DataFrame,
+    model_name: str,
+    lag_time: int,
+    lead_time: int,
+    target: str,
+    group_ids: list[str],
+) -> TimeSeriesDataSet:
+    if model_name == "NBEATS":
+        return TimeSeriesDataSet(
+            df,
+            time_idx="time_idx",
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=lag_time,
+            max_prediction_length=lead_time,
+            time_varying_unknown_reals=[target],
+            add_relative_time_idx=False,
+            add_target_scales=False,
+        )
+
+    elif model_name in ["TFT", "DEEPAR"]:
+        return TimeSeriesDataSet(
+            df,
+            time_idx="time_idx",
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=lag_time,
+            max_prediction_length=lead_time,
+            time_varying_unknown_reals=[target],
+            time_varying_known_reals=["time_idx", "month", "day_of_week"],
+            add_relative_time_idx=True,
+            add_target_scales=True,
+        )
+
+    else:
+        raise ValueError(model_name)
+
+
+def main() -> None:
+    pl.seed_everything(42)
+
+    model_name = "NBEATS"
+
+    group_ids = ["series"]
+    target = "USD_CLOSE"
+    lag_time = 90
+    lead_time = 60
+
     # --- 1. Load and preprocess data ---
     df = load_exchange_dataset("boc_exchange/dataset.csv")
+    df["series"] = 0
+    df["time_idx"] = (df["date"] - df["date"].min()).dt.days
+
     train_df, val_df, test_df = split_dataset(df, train_ratio=0.7, val_ratio=0.1)
 
     # Add time features for TFT / DeepAR
     for dataset in [train_df, val_df, test_df]:
         dataset["month"] = dataset["date"].dt.month.astype("int")
         dataset["day_of_week"] = dataset["date"].dt.dayofweek.astype("int")
-        dataset["time_idx"] = (dataset["date"] - dataset["date"].min()).dt.days
-
-    TARGET = "USD_CLOSE"
-    GROUP_IDS = ["dummy"]  # Single time series in this case
 
     # --- 2. Build pytorch-forecasting dataset ---
-    max_encoder_length = 90
-    max_prediction_length = 60
-
-    train_dataset = TimeSeriesDataSet(
-        train_df,
-        time_idx="time_idx",
-        target=TARGET,
-        group_ids=GROUP_IDS,
-        max_encoder_length=max_encoder_length,
-        max_prediction_length=max_prediction_length,
-        time_varying_unknown_reals=[TARGET],
-        time_varying_known_reals=["time_idx", "month", "day_of_week"],
-        add_relative_time_idx=True,
-        add_target_scales=True,
-    )
+    train_dataset = build_dataset(train_df, model_name, lag_time, lead_time, target, group_ids)
 
     val_dataset = TimeSeriesDataSet.from_dataset(
         train_dataset, val_df, predict=True, stop_randomization=True
@@ -73,69 +128,106 @@ def main():
         train_dataset, test_df, predict=True, stop_randomization=True
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=4)
+    train_loader = train_dataset.to_dataloader(train=True, batch_size=64, num_workers=0)
+    val_loader = val_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
+    test_loader = test_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
 
     # --- 3. Select model ---
-    MODEL_NAME = "TFT"  # choose from: "NBEATS", "TFT", "DeepAR"
-
-    if MODEL_NAME == "NBEATS":
+    if model_name == "NBEATS":
         model_class = NBeats
-    elif MODEL_NAME == "TFT":
+        extra_args = {}
+    elif model_name == "TFT":
         model_class = TemporalFusionTransformer
-    elif MODEL_NAME == "DeepAR":
+        extra_args = {"attention_head_size": 4}
+    elif model_name == "DEEPAR":
         model_class = DeepAR
+        extra_args = {}
     else:
-        raise ValueError(f"Unknown model {MODEL_NAME}")
+        raise ValueError(f"Unknown model {model_name}")
 
-    model = model_class.from_dataset(
-        train_dataset,
-        learning_rate=1e-3,
-        log_interval=10,
-        log_val_interval=1,
-        hidden_size=32,
-        attention_head_size=4 if MODEL_NAME == "TFT" else None,
-        dropout=0.1,
-        loss=MAE(),
-        optimizer="adam",
-    )
+    if model_name == "NBEATS":
+        model = NBeats.from_dataset(
+            train_dataset,
+            learning_rate=1e-3,
+            loss=MAE(),
+            # --- architecture ---
+            stack_types=["generic"],
+            num_blocks=[3],
+            num_block_layers=[4],
+            widths=[256],
+            # --- regularization ---
+            dropout=0.1,
+            weight_decay=1e-4,
+            # --- training behavior ---
+            backcast_loss_ratio=0.0,
+            reduce_on_plateau_patience=5,
+            log_interval=10,
+            log_val_interval=1,
+        )
+    else:
+        model = model_class.from_dataset(
+            train_dataset,
+            learning_rate=1e-3,
+            hidden_size=32,
+            dropout=0.1,
+            loss=MAE(),
+            log_interval=10,
+            log_val_interval=1,
+            **extra_args,
+        )
 
     # --- 4. Train model ---
-    trainer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    logger.info(f"Training {MODEL_NAME} model on {len(train_dataset)} samples")
+    logger.info(f"Training {model_name} model on {len(train_dataset)} samples")
 
     trainer = Trainer(
         max_epochs=20,
-        gpus=1 if torch.cuda.is_available() else 0,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
         gradient_clip_val=0.1,
-        limit_train_batches=1.0,  # fraction or integer
     )
 
-    trainer.fit(model, train_dataloader=train_loader, val_dataloaders=val_loader)
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     # --- 5. Inference ---
-    raw_predictions, x = model.predict(test_loader, mode="raw", return_x=True)
-    predictions = model.predict(test_loader)
+    prediction = model.predict(test_loader, mode="raw", return_x=True)
+    raw_predictions = prediction.output
+    x = prediction.x
 
-    # Convert predictions to series aligned with dates
-    pred_series = pd.Series(predictions.numpy(), index=test_df["date"].iloc[: len(predictions)])
-
-    # --- 6. Evaluation ---
-    from time_series_dl.evaluation.statistics import (
-        compute_metrics,
-        compute_statistics,
-        compute_horizon_metrics,
+    forecasts = convert_predictions_to_forecasts(raw_predictions, x, test_df)
+    # ----------------------------
+    # 6. Build evaluation dataset (IMPORTANT)
+    # ----------------------------
+    test_eval_dataset = build_forecasting_dataset(
+        test_df,
+        lag_time=lag_time,
+        lead_time=lead_time,
+        target_column=target,
     )
-    from time_series_dl.metrics.metrics import get_metrics
 
+    # ----------------------------
+    # 7. Evaluation
+    # ----------------------------
     metrics = get_metrics()
-    forecasts = [pred_series]  # wrap as list to reuse your functions
 
-    metric_values = compute_metrics(forecasts, test_dataset, metrics, TARGET)
+    metric_values = compute_metrics(
+        forecasts,
+        test_eval_dataset,
+        metrics,
+        target,
+    )
+
     statistics = compute_statistics(metric_values)
-    horizon_metrics = compute_horizon_metrics(forecasts, test_dataset, metrics, TARGET)
 
+    horizon_metrics = compute_horizon_metrics(
+        forecasts,
+        test_eval_dataset,
+        metrics,
+        target,
+    )
+
+    # ----------------------------
+    # 8. Save results
+    # ----------------------------
     results_dir = Path("results/dl_models")
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -144,8 +236,9 @@ def main():
         "horizon_metrics": horizon_metrics,
     }
 
-    save_json(results, results_dir / f"{MODEL_NAME}_results.json")
-    logger.info(f"Training and evaluation of {MODEL_NAME} completed. Results saved.")
+    save_json(results, results_dir / f"{model_name}_results.json")
+
+    logger.info("Finished. Results saved.")
 
 
 if __name__ == "__main__":
