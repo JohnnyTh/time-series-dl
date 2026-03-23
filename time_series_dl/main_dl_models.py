@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from time_series_dl.data.dataset import (
     load_exchange_dataset,
@@ -266,15 +267,27 @@ def main() -> None:
 
     loss_callback = LossHistoryCallback(loss_path)
 
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints/",
+        filename=f"{model_name}-{{epoch:02d}}-{{val_loss:.4f}}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,  # keep only best model
+        save_last=False,
+    )
     trainer = Trainer(
         max_epochs=30,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         gradient_clip_val=0.1,
-        callbacks=[loss_callback],
+        callbacks=[loss_callback, checkpoint_callback],
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    best_model_path = checkpoint_callback.best_model_path
+    logger.info(f"Load best model from checkpoint={best_model_path}")
+    model = model.__class__.load_from_checkpoint(best_model_path)
 
     # --- 5. Inference ---
     prediction = model.predict(test_loader, mode="raw", return_x=True)
