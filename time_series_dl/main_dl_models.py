@@ -1,7 +1,9 @@
+import json
 import logging
 import typing
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from time_series_dl.data.dataset import (
@@ -25,15 +27,40 @@ from pytorch_forecasting.metrics import MAE
 from time_series_dl.utils.io import save_json
 
 
-from time_series_dl.evaluation.statistics import (
-    compute_metrics,
-    compute_statistics,
-    compute_horizon_metrics,
-)
+from time_series_dl.evaluation.statistics import compute_statistics
 from time_series_dl.metrics.metrics import get_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+class LossHistoryCallback(pl.Callback):
+    def __init__(self, save_path: Path):
+        self.save_path = save_path
+        self.history = {
+            "train_loss": [],
+            "val_loss": [],
+        }
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+
+        train_loss = metrics.get("train_loss")
+        if train_loss is not None:
+            self.history["train_loss"].append(float(train_loss.cpu()))
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+
+        val_loss = metrics.get("val_loss")
+        if val_loss is not None:
+            self.history["val_loss"].append(float(val_loss.cpu()))
+
+    def on_fit_end(self, trainer, pl_module):
+        self.save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(self.save_path, "w") as f:
+            json.dump(self.history, f, indent=4)
 
 
 def convert_predictions_to_forecasts(
@@ -96,6 +123,61 @@ def build_dataset(
         raise ValueError(model_name)
 
 
+def convert_predictions_to_forecasts_and_truth(
+    prediction,
+    df: pd.DataFrame,
+):
+    forecasts = []
+    targets = []
+
+    pred_values = prediction.output["prediction"].detach().cpu().numpy()
+    decoder_target = prediction.x["decoder_target"].detach().cpu().numpy()
+    time_idx = prediction.x["decoder_time_idx"].detach().cpu().numpy()
+
+    date_lookup = df.set_index("time_idx")["date"]
+
+    for i in range(pred_values.shape[0]):
+
+        y_pred = pred_values[i].squeeze(-1)
+        y_true = decoder_target[i]
+        idx = time_idx[i]
+
+        dates = date_lookup.reindex(idx)
+
+        forecasts.append(pd.Series(y_pred, index=dates.values))
+        targets.append(pd.Series(y_true, index=dates.values))
+
+    return forecasts, targets
+
+
+def compute_metrics_direct(forecasts, targets, metrics):
+    results = {k: [] for k in metrics}
+
+    for y_pred, y_true in zip(forecasts, targets):
+        for name, fn in metrics.items():
+            results[name].append(fn(y_true, y_pred))
+
+    return results
+
+
+def compute_horizon_metrics_direct(forecasts, targets, metrics):
+    lead_time = len(forecasts[0])
+    horizon_results = {}
+
+    for h in range(lead_time):
+        horizon_results[h + 1] = {}
+
+        for name in metrics:
+            values = []
+
+            for y_pred, y_true in zip(forecasts, targets):
+                values.append(fn := metrics[name]([y_true.iloc[h]], [y_pred.iloc[h]]))
+
+            horizon_results[h + 1][name] = float(np.mean(values))
+
+    return horizon_results
+
+
 def main() -> None:
     pl.seed_everything(42)
 
@@ -122,10 +204,10 @@ def main() -> None:
     train_dataset = build_dataset(train_df, model_name, lag_time, lead_time, target, group_ids)
 
     val_dataset = TimeSeriesDataSet.from_dataset(
-        train_dataset, val_df, predict=True, stop_randomization=True
+        train_dataset, val_df, predict=False, stop_randomization=True
     )
     test_dataset = TimeSeriesDataSet.from_dataset(
-        train_dataset, test_df, predict=True, stop_randomization=True
+        train_dataset, test_df, predict=False, stop_randomization=True
     )
 
     train_loader = train_dataset.to_dataloader(train=True, batch_size=64, num_workers=0)
@@ -179,54 +261,37 @@ def main() -> None:
     # --- 4. Train model ---
     logger.info(f"Training {model_name} model on {len(train_dataset)} samples")
 
+    results_dir = Path("results/dl_models")
+    loss_path = results_dir / f"{model_name}_loss_history.json"
+
+    loss_callback = LossHistoryCallback(loss_path)
+
     trainer = Trainer(
-        max_epochs=20,
+        max_epochs=30,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         gradient_clip_val=0.1,
+        callbacks=[loss_callback],
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     # --- 5. Inference ---
     prediction = model.predict(test_loader, mode="raw", return_x=True)
-    raw_predictions = prediction.output
-    x = prediction.x
 
-    forecasts = convert_predictions_to_forecasts(raw_predictions, x, test_df)
-    # ----------------------------
-    # 6. Build evaluation dataset (IMPORTANT)
-    # ----------------------------
-    test_eval_dataset = build_forecasting_dataset(
-        test_df,
-        lag_time=lag_time,
-        lead_time=lead_time,
-        target_column=target,
-    )
+    forecasts, targets = convert_predictions_to_forecasts_and_truth(prediction, test_df)
 
     # ----------------------------
-    # 7. Evaluation
+    # 6. Evaluation
     # ----------------------------
     metrics = get_metrics()
 
-    metric_values = compute_metrics(
-        forecasts,
-        test_eval_dataset,
-        metrics,
-        target,
-    )
-
+    metric_values = compute_metrics_direct(forecasts, targets, metrics)
     statistics = compute_statistics(metric_values)
-
-    horizon_metrics = compute_horizon_metrics(
-        forecasts,
-        test_eval_dataset,
-        metrics,
-        target,
-    )
+    horizon_metrics = compute_horizon_metrics_direct(forecasts, targets, metrics)
 
     # ----------------------------
-    # 8. Save results
+    # 7. Save results
     # ----------------------------
     results_dir = Path("results/dl_models")
     results_dir.mkdir(parents=True, exist_ok=True)
