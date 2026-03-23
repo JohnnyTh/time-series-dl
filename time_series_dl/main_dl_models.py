@@ -1,16 +1,16 @@
 import json
+import warnings
 import logging
 import typing
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
 from time_series_dl.data.dataset import (
     load_exchange_dataset,
-    split_dataset,
-    build_forecasting_dataset,
+    split_dataset
 )
 
 import pytorch_lightning as pl
@@ -31,6 +31,14 @@ from time_series_dl.utils.io import save_json
 from time_series_dl.evaluation.statistics import compute_statistics
 from time_series_dl.metrics.metrics import get_metrics
 
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names",
+    category=UserWarning,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -46,7 +54,7 @@ class LossHistoryCallback(pl.Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         metrics = trainer.callback_metrics
 
-        train_loss = metrics.get("train_loss")
+        train_loss = metrics.get("train_loss_epoch")
         if train_loss is not None:
             self.history["train_loss"].append(float(train_loss.cpu()))
 
@@ -118,6 +126,7 @@ def build_dataset(
             time_varying_known_reals=["time_idx", "month", "day_of_week"],
             add_relative_time_idx=True,
             add_target_scales=True,
+            static_categoricals=["series"],
         )
 
     else:
@@ -182,7 +191,7 @@ def compute_horizon_metrics_direct(forecasts, targets, metrics):
 def main() -> None:
     pl.seed_everything(42)
 
-    model_name = "NBEATS"
+    model_name = "TFT"
 
     group_ids = ["series"]
     target = "USD_CLOSE"
@@ -191,7 +200,7 @@ def main() -> None:
 
     # --- 1. Load and preprocess data ---
     df = load_exchange_dataset("boc_exchange/dataset.csv")
-    df["series"] = 0
+    df["series"] = pd.Series("series_0", index=df.index, dtype="category")
     df["time_idx"] = (df["date"] - df["date"].min()).dt.days
 
     train_df, val_df, test_df = split_dataset(df, train_ratio=0.7, val_ratio=0.1)
@@ -247,6 +256,21 @@ def main() -> None:
             log_interval=10,
             log_val_interval=1,
         )
+    elif model_name == "TFT":
+        model = TemporalFusionTransformer.from_dataset(
+            train_dataset,
+            learning_rate=3e-4,
+            hidden_size=16,
+            lstm_layers=1,
+            attention_head_size=1,
+            hidden_continuous_size=8,
+            dropout=0.2,
+            loss=MAE(),
+            output_size=1,
+            reduce_on_plateau_patience=5,
+            log_interval=10,
+            log_val_interval=1,
+        )
     else:
         model = model_class.from_dataset(
             train_dataset,
@@ -275,12 +299,14 @@ def main() -> None:
         save_top_k=1,  # keep only best model
         save_last=False,
     )
+    early_stop_callback = EarlyStopping(monitor="val_loss", patience=8, mode="min")
+
     trainer = Trainer(
         max_epochs=30,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         gradient_clip_val=0.1,
-        callbacks=[loss_callback, checkpoint_callback],
+        callbacks=[loss_callback, checkpoint_callback, early_stop_callback],
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
