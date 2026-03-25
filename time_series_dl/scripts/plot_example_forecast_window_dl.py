@@ -7,6 +7,7 @@ from pytorch_forecasting import (
     TemporalFusionTransformer,
     DeepAR,
     TimeSeriesDataSet,
+    GroupNormalizer,
 )
 
 from time_series_dl.data.dataset import load_exchange_dataset
@@ -20,7 +21,7 @@ def load_model(model_name: str, checkpoint_path: str):
         return NBeats.load_from_checkpoint(checkpoint_path)
     elif model_name == "TFT":
         return TemporalFusionTransformer.load_from_checkpoint(checkpoint_path)
-    elif model_name == "DEEPAR":
+    elif model_name == "DEEP_AR":
         return DeepAR.load_from_checkpoint(checkpoint_path)
     else:
         raise ValueError(f"Unknown model {model_name}")
@@ -44,8 +45,7 @@ def build_full_dataset(df: pd.DataFrame, model_name: str) -> TimeSeriesDataSet:
             add_relative_time_idx=False,
             add_target_scales=False,
         )
-
-    elif model_name in ["TFT", "DEEPAR"]:
+    elif model_name == "TFT":
         return TimeSeriesDataSet(
             df,
             time_idx="time_idx",
@@ -61,7 +61,23 @@ def build_full_dataset(df: pd.DataFrame, model_name: str) -> TimeSeriesDataSet:
             add_relative_time_idx=True,
             add_target_scales=True,
         )
-
+    elif model_name == "DEEP_AR":
+        return TimeSeriesDataSet(
+            df,
+            time_idx="time_idx",
+            target="USD_CLOSE",
+            group_ids=["series"],
+            min_encoder_length=90,
+            max_encoder_length=90,
+            min_prediction_length=60,
+            max_prediction_length=60,
+            time_varying_unknown_reals=["USD_CLOSE"],
+            time_varying_known_reals=["month", "day_of_week"],
+            add_relative_time_idx=True,
+            add_target_scales=True,
+            static_categoricals=["series"],  # must have at least one
+            target_normalizer=GroupNormalizer(groups=["series"]),
+        )
     else:
         raise ValueError(model_name)
 
@@ -128,6 +144,8 @@ def plot_example_forecast_window(
         prediction = model(batch[0])
         forecast = prediction["prediction"].squeeze().cpu().numpy()
 
+    if model_name == "DEEP_AR":
+        forecast = forecast.mean(-1)
     # ----------------------------
     # Plot
     # ----------------------------
@@ -181,12 +199,12 @@ def plot_example_forecast_window(
 # Main
 # ----------------------------
 def main():
-    model_name = "TFT"  # change: NBEATS / TFT / DEEPAR
+    model_name = "DEEP_AR"  # change: NBEATS / TFT / DEEPAR
 
     checkpoint_map = {
         "NBEATS": "checkpoints/NBEATS-epoch=20-val_loss=0.0243.ckpt",
         "TFT": "checkpoints/TFT-epoch=06-val_loss=0.0267-v1.ckpt",
-        "DEEPAR": "checkpoints/DEEPAR-best.ckpt",
+        "DEEP_AR": "checkpoints/DEEP_AR-epoch=29-val_loss=-3.3002.ckpt",
     }
 
     df = load_exchange_dataset("boc_exchange/dataset.csv")
