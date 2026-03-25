@@ -71,7 +71,7 @@ def plot_loss_history(
 
 if __name__ == "__main__":
     plot_loss_history(
-        json_path="results/dl_models/NBEATS_loss_history.json",
-        save_path="figures/nbeats_loss.png",
-        title="N-BEATS Training and Validation Loss",
+        json_path="results/dl_models/TFT_loss_history.json",
+        save_path="figures/tft_loss.png",
+        title="Temporal Fusion Transformer Training and Validation Loss",
     )

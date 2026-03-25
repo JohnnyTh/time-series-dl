@@ -8,10 +8,7 @@ import numpy as np
 import pandas as pd
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
-from time_series_dl.data.dataset import (
-    load_exchange_dataset,
-    split_dataset
-)
+from time_series_dl.data.dataset import load_exchange_dataset, split_dataset
 
 import pytorch_lightning as pl
 from lightning.pytorch import Trainer
@@ -22,6 +19,8 @@ from pytorch_forecasting import (
     NBeats,
     TemporalFusionTransformer,
     DeepAR,
+    NormalDistributionLoss,
+    GroupNormalizer,
 )
 from pytorch_forecasting.metrics import MAE
 
@@ -30,8 +29,6 @@ from time_series_dl.utils.io import save_json
 
 from time_series_dl.evaluation.statistics import compute_statistics
 from time_series_dl.metrics.metrics import get_metrics
-
-
 
 warnings.filterwarnings(
     "ignore",
@@ -114,7 +111,7 @@ def build_dataset(
             add_target_scales=False,
         )
 
-    elif model_name in ["TFT", "DEEPAR"]:
+    elif model_name == "TFT":
         return TimeSeriesDataSet(
             df,
             time_idx="time_idx",
@@ -128,15 +125,26 @@ def build_dataset(
             add_target_scales=True,
             static_categoricals=["series"],
         )
-
+    elif model_name == "DEEP_AR":
+        return TimeSeriesDataSet(
+            df,
+            time_idx="time_idx",
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=lag_time,
+            max_prediction_length=lead_time,
+            time_varying_unknown_reals=[target],
+            time_varying_known_reals=["month", "day_of_week"],
+            add_relative_time_idx=True,
+            add_target_scales=True,
+            static_categoricals=[],
+            target_normalizer=GroupNormalizer(groups=["series"]),
+        )
     else:
         raise ValueError(model_name)
 
 
-def convert_predictions_to_forecasts_and_truth(
-    prediction,
-    df: pd.DataFrame,
-):
+def convert_predictions_to_forecasts_and_truth(prediction, df: pd.DataFrame, model_name: str):
     forecasts = []
     targets = []
 
@@ -148,7 +156,12 @@ def convert_predictions_to_forecasts_and_truth(
 
     for i in range(pred_values.shape[0]):
 
-        y_pred = pred_values[i].squeeze(-1)
+        if model_name in ["NBEATS", "TFT"]:
+            y_pred = pred_values[i].squeeze(-1)
+        elif model_name == "DEEP_AR":
+            y_pred = pred_values[i].mean(-1)
+        else:
+            raise ValueError(f"Unk model name={model_name}")
         y_true = decoder_target[i]
         idx = time_idx[i]
 
@@ -191,7 +204,7 @@ def compute_horizon_metrics_direct(forecasts, targets, metrics):
 def main() -> None:
     pl.seed_everything(42)
 
-    model_name = "TFT"
+    model_name = "DEEP_AR"
 
     group_ids = ["series"]
     target = "USD_CLOSE"
@@ -224,19 +237,6 @@ def main() -> None:
     val_loader = val_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
     test_loader = test_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
 
-    # --- 3. Select model ---
-    if model_name == "NBEATS":
-        model_class = NBeats
-        extra_args = {}
-    elif model_name == "TFT":
-        model_class = TemporalFusionTransformer
-        extra_args = {"attention_head_size": 4}
-    elif model_name == "DEEPAR":
-        model_class = DeepAR
-        extra_args = {}
-    else:
-        raise ValueError(f"Unknown model {model_name}")
-
     if model_name == "NBEATS":
         model = NBeats.from_dataset(
             train_dataset,
@@ -261,7 +261,7 @@ def main() -> None:
             train_dataset,
             learning_rate=3e-4,
             hidden_size=16,
-            lstm_layers=1,
+            lstm_layers=2,
             attention_head_size=1,
             hidden_continuous_size=8,
             dropout=0.2,
@@ -272,15 +272,21 @@ def main() -> None:
             log_val_interval=1,
         )
     else:
-        model = model_class.from_dataset(
+        model = DeepAR.from_dataset(
             train_dataset,
-            learning_rate=1e-3,
-            hidden_size=32,
-            dropout=0.1,
-            loss=MAE(),
+            # --- optimization ---
+            learning_rate=3e-4,  # more stable for RNNs
+            reduce_on_plateau_patience=5,
+            # --- architecture ---
+            hidden_size=64,  # increase capacity
+            rnn_layers=3,  # deeper temporal modeling
+            dropout=0.2,  # stronger regularization
+            cell_type="LSTM",  # keep LSTM (better for long memory)
+            # --- probabilistic modeling ---
+            loss=NormalDistributionLoss(),
+            # --- logging ---
             log_interval=10,
             log_val_interval=1,
-            **extra_args,
         )
 
     # --- 4. Train model ---
@@ -318,7 +324,7 @@ def main() -> None:
     # --- 5. Inference ---
     prediction = model.predict(test_loader, mode="raw", return_x=True)
 
-    forecasts, targets = convert_predictions_to_forecasts_and_truth(prediction, test_df)
+    forecasts, targets = convert_predictions_to_forecasts_and_truth(prediction, test_df, model_name=model_name)
 
     # ----------------------------
     # 6. Evaluation
